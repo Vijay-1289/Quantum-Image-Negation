@@ -1,0 +1,161 @@
+import numpy as np
+from qiskit import QuantumCircuit, QuantumRegister, ClassicalRegister, transpile
+from qiskit_aer import AerSimulator
+from qiskit.quantum_info import Statevector
+from qiskit.circuit.library import RYGate
+from qiskit.visualization import plot_histogram
+import matplotlib.pyplot as plt
+
+def hadamard(circ, n):
+    for i in n:
+        circ.h(i)
+
+def change(state, new_state):
+    n = len(state)
+    c = np.array([])
+    for i in range(n):
+        if state[i] != new_state[i]:
+            c = np.append(c, int(i))
+    return c.astype(int) if len(c) > 0 else c
+
+def binary(circ, state, new_state, k):
+    c = change(state, new_state)
+    if len(c) > 0:
+        for i in c:
+            circ.x(i)  # Correctly flip position qubits
+    else:
+        pass
+
+def cnri(circ, control_qubits, target_qubit, theta):
+    controls = len(control_qubits)
+    cry = RYGate(theta).control(controls)  # Use theta, not 2*theta
+    aux = np.append(control_qubits, target_qubit).tolist()
+    circ.append(cry, aux)
+
+def frqi_pixel(circ, control_qubits, target_qubit, angle, position_idx, num_qubits):
+    # Set position qubits to |position_idx>
+    bin_idx = format(position_idx, f'0{num_qubits}b')
+    for bit, qubit in enumerate(control_qubits):
+        if bin_idx[bit] == '1':
+            circ.x(qubit)
+    
+    # Encode intensity with controlled Ry(theta)
+    if angle > 0:
+        cnri(circ, control_qubits, target_qubit, angle)
+    
+    circ.barrier(label="After_Encoding")
+    circ.save_statevector(label="state_before_negation")
+    
+    # Negation: Reset intensity to |0> and apply controlled Ry(pi/2 - theta)
+    negated_theta = np.pi/2 - angle
+    if angle > 0:  # Reset only if not |0>
+        circ.x(target_qubit)
+    if negated_theta >= 0:
+        cnri(circ, control_qubits, target_qubit, negated_theta)
+    if angle > 0:
+        circ.x(target_qubit)  # Restore basis
+    
+    circ.barrier(label="After_Negation")
+    circ.save_statevector(label="state_after_negation")
+
+# Input 2x2 binary image
+image = np.array([
+    [1, 0],
+    [1, 0]
+])
+print("\nOriginal Image (Binary):")
+print(image)
+
+n = image.shape[0]  # Assuming square image
+num_pixels = n * n
+q = int(np.ceil(np.log2(num_pixels)))  # Qubits for positions
+print(f"Image size: {n}x{n}, using {q} control qubits")
+
+# Compute angles for binary pixels (0 or 1)
+angles = np.pi/2 * image.flatten()  # 0 → 0, 1 → pi/2
+
+# Compute negated image
+negated_image = 1 - image
+print("\nNegated Image (Binary):")
+print(negated_image)
+
+# Process each pixel
+pixels = [
+    (image[0,0], 0, (0,0)),  # Pixel at (0,0) -> |00>
+    (image[0,1], 1, (0,1)),  # Pixel at (0,1) -> |01>
+    (image[1,0], 2, (1,0)),  # Pixel at (1,0) -> |10>
+    (image[1,1], 3, (1,1))   # Pixel at (1,1) -> |11>
+]
+
+shots = 999999
+simulator = AerSimulator()
+
+for pixel_value, pos_idx, pos in pixels:
+    # Quantum Circuit Setup
+    qr = QuantumRegister(q + 1, 'q')  # +1 for intensity qubit
+    cr = ClassicalRegister(1, 'c')  # Measure only intensity qubit
+    qc = QuantumCircuit(qr, cr)
+    
+    control_qubits = list(range(q))
+    target_qubit = q
+    
+    # Build FRQI circuit for this pixel
+    angle = angles[pos_idx]
+    frqi_pixel(qc, control_qubits, target_qubit, angle, pos_idx, q)
+    
+    # Measure intensity qubit
+    qc.measure(target_qubit, cr)
+    
+    # Simulate
+    transpiled = transpile(qc, simulator)
+    job = simulator.run(transpiled, shots=shots)
+    result = job.result()
+    
+    # Print circuit
+    print(f"\nFRQI Circuit for Pixel {pixel_value} at Position {pos}:")
+    print(qc.draw(output="text"))
+    
+    # Statevectors
+    data = result.data()
+    sv_before = data.get('state_before_negation')
+    sv_after = data.get('state_after_negation')
+    
+    print("\nStatevector BEFORE negation:")
+    if sv_before:
+        s_vec = Statevector(sv_before)
+        for i, amp in enumerate(s_vec.data):
+            if not np.isclose(abs(amp), 0.0):
+                intensity_bit = i // 4
+                pos_state = i % 4
+                print(f"{amp:.3f} |{intensity_bit}{format(pos_state, '02b')}>")
+    
+    print("\nStatevector AFTER negation:")
+    if sv_after:
+        s_vec = Statevector(sv_after)
+        for i, amp in enumerate(s_vec.data):
+            if not np.isclose(abs(amp), 0.0):
+                intensity_bit = i // 4
+                pos_state = i % 4
+                print(f"{amp:.3f} |{intensity_bit}{format(pos_state, '02b')}>")
+    
+    # Estimate negated pixel value
+    counts = result.get_counts()
+    count_1 = counts.get('1', 0)
+    count_0 = counts.get('0', 0)
+    total = count_0 + count_1
+    negated_pixel = 0
+    if total > 0:
+        prob_1 = count_1 / total
+        theta_prime = 2 * np.arcsin(np.sqrt(prob_1))
+        negated_pixel = int((theta_prime / (np.pi/2)) + 0.5)  # Binary: 0 or 1
+    
+    print(f"\nExpected Negated Pixel Value: {1 - pixel_value}")
+    print(f"Measured Negated Pixel Value: {negated_pixel}")
+
+# Plot negated image
+plt.figure(figsize=(4, 2))
+plt.imshow(negated_image, cmap='gray', vmin=0, vmax=1)
+plt.title("Negated Image (Quantum)")
+plt.axis('off')
+plt.savefig('negated_image_binary.png')
+plt.close()
